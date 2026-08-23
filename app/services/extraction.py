@@ -14,19 +14,24 @@ Supports:
 - GIF
 - BMP
 
-For scanned/handwritten pages and images, OpenAI Vision is used
-as an OCR fallback.
+Gemini is used for OCR of:
+- scanned PDFs
+- handwritten PDFs
+- images
+- screenshots
+- handwritten notes
 """
 
 from io import BytesIO
 from pathlib import Path
-import base64
 import os
 
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from pptx import Presentation
-from openai import OpenAI
+
+from google import genai
+from google.genai import types
 
 # PyMuPDF is used to render scanned PDF pages as images
 import fitz
@@ -34,22 +39,36 @@ import fitz
 
 MAX_CHARS = 60_000
 
-# Vision model for OCR
-OCR_MODEL = os.getenv("OCR_MODEL", "gpt-4o-mini")
+OCR_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.0-flash",
+)
 
 
 class UnsupportedDocumentError(Exception):
     pass
 
 
-def _get_openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+def _get_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY")
 
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured.")
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured."
+        )
 
-    return OpenAI(api_key=api_key)
+    return genai.Client(
+        api_key=api_key
+    )
 
+
+# ============================================================
+# MAIN EXTRACTION FUNCTION
+# ============================================================
 
 def extract_text(
     data: bytes,
@@ -58,21 +77,30 @@ def extract_text(
 ) -> str:
 
     suffix = Path(filename).suffix.lower()
-    mime_type = (mime_type or "").lower().split(";")[0].strip()
+
+    mime_type = (
+        mime_type or ""
+    ).lower().split(";")[0].strip()
 
     # ---------------------------------------------------------
     # PDF
     # ---------------------------------------------------------
-    if mime_type == "application/pdf" or suffix == ".pdf":
+
+    if (
+        mime_type == "application/pdf"
+        or suffix == ".pdf"
+    ):
         text = _extract_pdf(data)
 
-        # If PDF has no usable text, use OCR
+        # If normal PDF extraction fails,
+        # render pages and use Gemini OCR.
         if not text.strip():
             text = _ocr_pdf(data)
 
     # ---------------------------------------------------------
     # DOCX
     # ---------------------------------------------------------
+
     elif (
         mime_type
         == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -83,6 +111,7 @@ def extract_text(
     # ---------------------------------------------------------
     # PPTX
     # ---------------------------------------------------------
+
     elif (
         mime_type
         == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -93,12 +122,17 @@ def extract_text(
     # ---------------------------------------------------------
     # TXT
     # ---------------------------------------------------------
-    elif mime_type == "text/plain" or suffix == ".txt":
+
+    elif (
+        mime_type == "text/plain"
+        or suffix == ".txt"
+    ):
         text = _extract_txt(data)
 
     # ---------------------------------------------------------
     # IMAGES
     # ---------------------------------------------------------
+
     elif (
         mime_type.startswith("image/")
         or suffix in {
@@ -110,11 +144,16 @@ def extract_text(
             ".bmp",
         }
     ):
-        text = _ocr_image(data, mime_type, suffix)
+        text = _ocr_image(
+            data,
+            mime_type,
+            suffix,
+        )
 
     else:
         raise UnsupportedDocumentError(
-            f"Unsupported document type: {mime_type or suffix}"
+            f"Unsupported document type: "
+            f"{mime_type or suffix}"
         )
 
     text = text.strip()
@@ -139,12 +178,19 @@ def extract_text(
 # ============================================================
 
 def _extract_pdf(data: bytes) -> str:
-    reader = PdfReader(BytesIO(data))
+
+    reader = PdfReader(
+        BytesIO(data)
+    )
 
     parts = []
 
     for page in reader.pages:
-        page_text = page.extract_text() or ""
+
+        page_text = (
+            page.extract_text()
+            or ""
+        )
 
         if page_text.strip():
             parts.append(page_text)
@@ -158,21 +204,27 @@ def _extract_pdf(data: bytes) -> str:
 
 def _ocr_pdf(data: bytes) -> str:
     """
-    Render each PDF page as an image and send it to
-    OpenAI Vision for OCR.
+    Render each PDF page as an image and send it to Gemini.
 
-    This handles:
+    Supports:
     - scanned PDFs
     - handwritten PDFs
     - photos saved as PDFs
+    - screenshots saved as PDFs
     """
 
-    pdf = fitz.open(stream=data, filetype="pdf")
+    pdf = fitz.open(
+        stream=data,
+        filetype="pdf",
+    )
 
     parts = []
 
     try:
-        for page_number, page in enumerate(pdf):
+
+        for page_number, page in enumerate(
+            pdf
+        ):
 
             # Render page at good resolution
             pix = page.get_pixmap(
@@ -180,7 +232,9 @@ def _ocr_pdf(data: bytes) -> str:
                 alpha=False,
             )
 
-            image_bytes = pix.tobytes("png")
+            image_bytes = pix.tobytes(
+                "png"
+            )
 
             page_text = _ocr_image_bytes(
                 image_bytes,
@@ -189,12 +243,18 @@ def _ocr_pdf(data: bytes) -> str:
             )
 
             if page_text.strip():
+
                 parts.append(
-                    f"[Page {page_number + 1}]\n{page_text}"
+                    f"[Page {page_number + 1}]\n"
+                    f"{page_text}"
                 )
 
-            # Avoid processing an extremely large PDF
-            if sum(len(x) for x in parts) >= MAX_CHARS:
+            # Avoid processing extremely
+            # large documents
+            if (
+                sum(len(x) for x in parts)
+                >= MAX_CHARS
+            ):
                 break
 
     finally:
@@ -213,7 +273,10 @@ def _ocr_image(
     suffix: str = "",
 ) -> str:
 
-    if not mime_type.startswith("image/"):
+    if not mime_type.startswith(
+        "image/"
+    ):
+
         mime_type = {
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
@@ -221,7 +284,10 @@ def _ocr_image(
             ".webp": "image/webp",
             ".gif": "image/gif",
             ".bmp": "image/bmp",
-        }.get(suffix, "image/png")
+        }.get(
+            suffix,
+            "image/png",
+        )
 
     return _ocr_image_bytes(
         data,
@@ -230,74 +296,92 @@ def _ocr_image(
     )
 
 
+# ============================================================
+# GEMINI IMAGE OCR
+# ============================================================
+
 def _ocr_image_bytes(
     image_bytes: bytes,
     mime_type: str,
     page_number: int = 1,
 ) -> str:
 
-    client = _get_openai_client()
+    client = _get_gemini_client()
 
-    encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = """
+You are a highly accurate OCR system for QuizNest.
 
-    response = client.chat.completions.create(
-        model=OCR_MODEL,
-        temperature=0,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a highly accurate OCR system for QuizNest. "
-                    "Extract all readable educational content from the "
-                    "provided image. This may contain printed text, "
-                    "handwritten text, mathematical expressions, "
-                    "questions, options, headings and notes. "
-                    "Preserve the original meaning and structure. "
-                    "Do not summarize, explain or invent missing text. "
-                    "If some text is unclear, make the best possible "
-                    "transcription and mark genuinely unreadable portions "
-                    "as [unclear]."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Extract all text from this image. "
-                            "Include handwritten and printed text. "
-                            "Return only the extracted/transcribed text."
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": (
-                                f"data:{mime_type};base64,"
-                                f"{encoded_image}"
-                            )
-                        },
-                    },
-                ],
-            },
-        ],
+Extract ALL readable educational content from
+the provided image.
+
+The image may contain:
+
+- printed text
+- handwritten text
+- handwritten notes
+- questions
+- multiple-choice options
+- headings
+- paragraphs
+- mathematical expressions
+- tables
+- diagrams containing readable text
+- screenshots
+- classroom notes
+
+IMPORTANT RULES:
+
+1. Transcribe the content accurately.
+2. Preserve the original meaning.
+3. Preserve headings and question structure.
+4. Include handwritten and printed text.
+5. Do not summarize.
+6. Do not explain.
+7. Do not invent missing content.
+8. If something is genuinely unreadable, write [unclear].
+9. Keep mathematical expressions as accurately as possible.
+10. Return ONLY the extracted/transcribed text.
+"""
+
+    image_part = types.Part.from_bytes(
+        data=image_bytes,
+        mime_type=mime_type,
     )
 
-    return response.choices[0].message.content or ""
+    response = client.models.generate_content(
+        model=OCR_MODEL,
+        contents=[
+            image_part,
+            prompt,
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0,
+        ),
+    )
+
+    if not response.text:
+        return ""
+
+    return response.text.strip()
 
 
 # ============================================================
 # DOCX
 # ============================================================
 
-def _extract_docx(data: bytes) -> str:
-    doc = DocxDocument(BytesIO(data))
+def _extract_docx(
+    data: bytes,
+) -> str:
+
+    doc = DocxDocument(
+        BytesIO(data)
+    )
 
     parts = []
 
     # Normal paragraphs
     for paragraph in doc.paragraphs:
+
         text = paragraph.text.strip()
 
         if text:
@@ -305,7 +389,9 @@ def _extract_docx(data: bytes) -> str:
 
     # Tables
     for table in doc.tables:
+
         for row in table.rows:
+
             row_text = " | ".join(
                 cell.text.strip()
                 for cell in row.cells
@@ -321,7 +407,10 @@ def _extract_docx(data: bytes) -> str:
 # TXT
 # ============================================================
 
-def _extract_txt(data: bytes) -> str:
+def _extract_txt(
+    data: bytes,
+) -> str:
+
     return data.decode(
         "utf-8",
         errors="ignore",
@@ -332,24 +421,36 @@ def _extract_txt(data: bytes) -> str:
 # PPTX
 # ============================================================
 
-def _extract_pptx(data: bytes) -> str:
-    prs = Presentation(BytesIO(data))
+def _extract_pptx(
+    data: bytes,
+) -> str:
+
+    prs = Presentation(
+        BytesIO(data)
+    )
 
     parts = []
 
-    for slide_number, slide in enumerate(prs.slides, start=1):
+    for slide_number, slide in enumerate(
+        prs.slides,
+        start=1,
+    ):
 
         slide_parts = []
 
         for shape in slide.shapes:
 
             if shape.has_text_frame:
+
                 text = shape.text.strip()
 
                 if text:
-                    slide_parts.append(text)
+                    slide_parts.append(
+                        text
+                    )
 
         if slide_parts:
+
             parts.append(
                 f"[Slide {slide_number}]\n"
                 + "\n".join(slide_parts)
