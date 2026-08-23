@@ -41,7 +41,7 @@ MAX_CHARS = 60_000
 
 OCR_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.0-flash",
+    "gemini-3.6-flash",
 )
 
 
