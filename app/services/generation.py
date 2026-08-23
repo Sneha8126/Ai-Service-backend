@@ -1,7 +1,8 @@
 import json
 from typing import Literal
 
-from openai import OpenAI, RateLimitError, APIError, APITimeoutError
+from google import genai
+from google.genai import types
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -10,9 +11,6 @@ from tenacity import (
 )
 
 from app.config import settings
-
-
-client = OpenAI(api_key=settings.openai_api_key)
 
 
 QuestionType = Literal[
@@ -31,61 +29,110 @@ Difficulty = Literal[
 ]
 
 
-SYSTEM_PROMPT = """You are a strict exam-question generator.
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
 
-Generate quiz questions based ONLY on the study material provided by the user.
+if not settings.gemini_api_key:
+    raise RuntimeError(
+        "GEMINI_API_KEY is not configured."
+    )
 
-Never invent facts, names, numbers, definitions, or information that is not supported by
-the study material.
+client = genai.Client(
+    api_key=settings.gemini_api_key
+)
 
-If the material does not contain enough information to create the requested number of
-good questions, generate only the number of high-quality questions that the material
-genuinely supports.
 
-Respond with ONLY a valid JSON object.
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
 
-Required format:
+SYSTEM_PROMPT = """
+You are a strict exam-question generator for QuizNest.
+
+Generate quiz questions based ONLY on the study material
+provided by the user.
+
+Never invent facts, names, numbers, definitions, examples,
+or information that is not supported by the study material.
+
+If the material does not contain enough information to create
+the requested number of good questions, generate only the
+number of high-quality questions that the material genuinely
+supports.
+
+Every question must be answerable strictly from the supplied
+study material.
+
+Return ONLY a valid JSON object in this format:
 
 {
   "questions": [
     {
       "questionText": "string",
-      "type": "mcq" | "true_false" | "multiple_correct" | "short_answer",
-      "options": ["string"],
-      "correctAnswer": "string" | ["string"],
-      "expectedAnswer": "string",
-      "keyConcepts": ["string"],
+      "type": "mcq",
+      "options": ["string", "string", "string", "string"],
+      "correctAnswer": "string",
       "explanation": "string",
-      "difficulty": "easy" | "medium" | "hard",
+      "difficulty": "easy",
       "topic": "string",
       "marks": 1
     }
   ]
 }
 
-Rules:
+QUESTION TYPE RULES:
 
-- mcq:
-  exactly 4 options
-  exactly 1 correct answer
+1. mcq
+- Exactly 4 options.
+- Exactly 1 correct answer.
+- correctAnswer must exactly match one option.
 
-- true_false:
-  options must be ["True", "False"]
-  correctAnswer must be "True" or "False"
+2. true_false
+- options must be exactly:
+  ["True", "False"]
+- correctAnswer must be exactly:
+  "True" or "False"
 
-- multiple_correct:
-  4 to 6 options
-  at least 2 correct answers
+3. multiple_correct
+- 4 to 6 options.
+- At least 2 correct answers.
+- correctAnswer must be an array.
+- Every correct answer must exactly match an option.
 
-- short_answer:
-  do not include options
-  do not include correctAnswer
-  include expectedAnswer
-  include 2 to 5 keyConcepts
+4. short_answer
+- Do NOT include options.
+- Do NOT include correctAnswer.
+- Include expectedAnswer.
+- Include keyConcepts with 2 to 5 concepts.
 
-- Every question must be answerable strictly from the supplied study material.
+For short_answer use:
+
+{
+  "questionText": "string",
+  "type": "short_answer",
+  "expectedAnswer": "string",
+  "keyConcepts": ["string"],
+  "explanation": "string",
+  "difficulty": "easy",
+  "topic": "string",
+  "marks": 1
+}
+
+DIFFICULTY:
+- easy
+- medium
+- hard
+
+Do not add markdown.
+Do not add ```json.
+Return only JSON.
 """
 
+
+# ============================================================
+# USER PROMPT
+# ============================================================
 
 def _build_user_prompt(
     document_text: str,
@@ -96,7 +143,8 @@ def _build_user_prompt(
 
     if question_type == "mixed":
         type_instruction = (
-            "Use a mix of mcq, true_false, multiple_correct, and short_answer."
+            "Use a mix of mcq, true_false, "
+            "multiple_correct, and short_answer."
         )
     else:
         type_instruction = (
@@ -112,7 +160,7 @@ def _build_user_prompt(
             f'Use only "{difficulty}" difficulty.'
         )
 
-    # Prevent extremely large documents from creating huge API requests.
+    # Keep request size reasonable.
     max_chars = 30000
 
     if len(document_text) > max_chars:
@@ -121,23 +169,35 @@ def _build_user_prompt(
     return f"""
 Study material:
 
-\"\"\"
-{document_text}
-\"\"\"
+"""
+    + document_text
+    + f"""
 
 Generate up to {num_questions} high-quality quiz questions.
 
+Question type:
 {type_instruction}
 
+Difficulty:
 {difficulty_instruction}
 
-Return ONLY JSON.
+IMPORTANT:
+
+- Use ONLY the supplied study material.
+- Do not use outside knowledge.
+- Do not invent information.
+- Make questions directly answerable from the material.
+- Return ONLY valid JSON.
 """
 
 
+# ============================================================
+# GEMINI API CALL
+# ============================================================
+
 @retry(
     retry=retry_if_exception_type(
-        (RateLimitError, APITimeoutError)
+        (Exception,)
     ),
     stop=stop_after_attempt(3),
     wait=wait_exponential(
@@ -147,50 +207,44 @@ Return ONLY JSON.
     ),
     reraise=True,
 )
-def _call_openai(
+def _call_gemini(
     system_prompt: str,
     user_prompt: str,
 ) -> str:
 
     try:
-        response = client.chat.completions.create(
-            model=settings.openai_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
+
+        response = client.models.generate_content(
+            model=settings.gemini_model,
+            contents=[
+                system_prompt,
+                user_prompt,
             ],
-            temperature=0.4,
-            response_format={
-                "type": "json_object"
-            },
+            config=types.GenerateContentConfig(
+                temperature=0.4,
+                response_mime_type="application/json",
+            ),
         )
 
-    except RateLimitError:
-        raise
+    except Exception as exc:
 
-    except APITimeoutError:
-        raise
-
-    except APIError as exc:
         raise RuntimeError(
-            f"OpenAI API error: {exc}"
+            f"Gemini API error: {exc}"
         ) from exc
 
-    content = response.choices[0].message.content
+    content = response.text
 
     if not content:
         raise ValueError(
-            "OpenAI returned an empty response"
+            "Gemini returned an empty response."
         )
 
     return content
 
+
+# ============================================================
+# GENERATE QUESTIONS
+# ============================================================
 
 def generate_questions(
     document_text: str,
@@ -207,58 +261,74 @@ def generate_questions(
     )
 
     try:
-        raw = _call_openai(
+
+        raw = _call_gemini(
             SYSTEM_PROMPT,
             user_prompt,
         )
 
-    except RateLimitError as exc:
-        raise RuntimeError(
-            "OpenAI API rate limit or quota reached. "
-            "Please check the OPENAI_API_KEY, API usage/quota, "
-            "and try again later."
-        ) from exc
-
-    except APITimeoutError as exc:
-        raise RuntimeError(
-            "OpenAI request timed out. Please try again."
-        ) from exc
-
     except Exception as exc:
+
         raise RuntimeError(
             f"AI generation failed: {exc}"
         ) from exc
 
+    # --------------------------------------------------------
+    # Parse JSON
+    # --------------------------------------------------------
+
     try:
+
         parsed = json.loads(raw)
 
     except json.JSONDecodeError as exc:
+
         raise ValueError(
-            f"Model returned invalid JSON: {exc}"
+            f"Gemini returned invalid JSON: {exc}"
         ) from exc
 
     questions = parsed.get("questions")
 
     if not isinstance(questions, list):
+
         raise ValueError(
-            "Model response does not contain a valid questions list."
+            "Gemini response does not contain "
+            "a valid questions list."
         )
 
-    valid_questions = [
-        _normalize_question(q)
-        for q in questions
-        if isinstance(q, dict) and _is_valid_question(q)
-    ]
+    # --------------------------------------------------------
+    # Validate questions
+    # --------------------------------------------------------
+
+    valid_questions = []
+
+    for question in questions:
+
+        if (
+            isinstance(question, dict)
+            and _is_valid_question(question)
+        ):
+
+            valid_questions.append(
+                _normalize_question(question)
+            )
 
     if not valid_questions:
+
         raise ValueError(
-            "AI returned no valid questions."
+            "Gemini returned no valid questions."
         )
 
     return valid_questions
 
 
-def _is_valid_question(q: dict) -> bool:
+# ============================================================
+# VALIDATE QUESTION
+# ============================================================
+
+def _is_valid_question(
+    q: dict,
+) -> bool:
 
     required = {
         "questionText",
@@ -268,61 +338,158 @@ def _is_valid_question(q: dict) -> bool:
         "marks",
     }
 
-    if not required.issubset(q.keys()):
+    if not required.issubset(
+        q.keys()
+    ):
         return False
 
-    question_type = q.get("type")
+    question_type = q.get(
+        "type"
+    )
+
+    # --------------------------------------------------------
+    # MCQ
+    # --------------------------------------------------------
 
     if question_type == "mcq":
-        options = q.get("options", [])
-        correct = q.get("correctAnswer")
+
+        options = q.get(
+            "options",
+            []
+        )
+
+        correct = q.get(
+            "correctAnswer"
+        )
 
         return (
-            isinstance(options, list)
+            isinstance(
+                options,
+                list
+            )
             and len(options) == 4
-            and isinstance(correct, str)
+            and isinstance(
+                correct,
+                str
+            )
             and correct in options
         )
 
+    # --------------------------------------------------------
+    # TRUE / FALSE
+    # --------------------------------------------------------
+
     if question_type == "true_false":
-        options = q.get("options", [])
-        correct = q.get("correctAnswer")
+
+        options = q.get(
+            "options",
+            []
+        )
+
+        correct = q.get(
+            "correctAnswer"
+        )
 
         return (
-            options == ["True", "False"]
-            and correct in ["True", "False"]
+            options
+            == [
+                "True",
+                "False"
+            ]
+            and correct
+            in [
+                "True",
+                "False"
+            ]
         )
+
+    # --------------------------------------------------------
+    # MULTIPLE CORRECT
+    # --------------------------------------------------------
 
     if question_type == "multiple_correct":
-        options = q.get("options", [])
-        correct = q.get("correctAnswer")
 
-        return (
-            isinstance(options, list)
-            and 4 <= len(options) <= 6
-            and isinstance(correct, list)
-            and len(correct) >= 2
-            and all(answer in options for answer in correct)
+        options = q.get(
+            "options",
+            []
         )
 
+        correct = q.get(
+            "correctAnswer"
+        )
+
+        return (
+            isinstance(
+                options,
+                list
+            )
+            and 4 <= len(options) <= 6
+            and isinstance(
+                correct,
+                list
+            )
+            and len(correct) >= 2
+            and all(
+                answer in options
+                for answer in correct
+            )
+        )
+
+    # --------------------------------------------------------
+    # SHORT ANSWER
+    # --------------------------------------------------------
+
     if question_type == "short_answer":
-        return bool(q.get("expectedAnswer"))
+
+        expected_answer = q.get(
+            "expectedAnswer"
+        )
+
+        key_concepts = q.get(
+            "keyConcepts"
+        )
+
+        return (
+            bool(expected_answer)
+            and isinstance(
+                key_concepts,
+                list
+            )
+            and 2 <= len(key_concepts) <= 5
+        )
 
     return False
 
 
-def _normalize_question(q: dict) -> dict:
+# ============================================================
+# NORMALIZE QUESTION
+# ============================================================
 
-    q["marks"] = int(q.get("marks") or 1)
+def _normalize_question(
+    q: dict,
+) -> dict:
 
+    # Marks
+    try:
+        q["marks"] = int(
+            q.get("marks") or 1
+        )
+    except (
+        ValueError,
+        TypeError
+    ):
+        q["marks"] = 1
+
+    # Topic
     q.setdefault(
         "topic",
-        "General",
+        "General"
     )
 
+    # Negative marking
     q.setdefault(
         "negativeMarks",
-        0,
+        0
     )
 
     return q

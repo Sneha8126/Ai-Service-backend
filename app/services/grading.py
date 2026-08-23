@@ -1,11 +1,12 @@
 import json
 
-from openai import OpenAI
+from google import genai
+from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
 
-client = OpenAI(api_key=settings.openai_api_key)
+client = genai.Client(api_key=settings.gemini_api_key)
 
 SYSTEM_PROMPT = """You are grading a student's short-answer response against an expected \
 answer and a list of key concepts. Judge on meaning and coverage of key concepts, not \
@@ -14,9 +15,9 @@ present.
 
 Respond with ONLY a JSON object of the form:
 {
-  "isCorrect": boolean,        // true if the answer substantially covers the expected answer
-  "marksAwarded": number,      // 0 to the max marks given, may be a fraction of full marks
-  "feedback": "string"         // one or two sentences explaining the grade to the student
+  "isCorrect": boolean,
+  "marksAwarded": number,
+  "feedback": "string"
 }
 """
 
@@ -36,22 +37,30 @@ Maximum marks: {marks}
 Student's answer: {student_answer}
 """
 
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+    response = client.models.generate_content(
+        model=settings.gemini_model,
+        contents=[
+            SYSTEM_PROMPT,
+            user_prompt,
         ],
-        temperature=0.2,
-        response_format={"type": "json_object"},
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            response_mime_type="application/json",
+        ),
     )
-    content = response.choices[0].message.content
+
+    content = response.text
+
     if not content:
-        raise ValueError("Empty response from OpenAI")
+        raise ValueError("Empty response from Gemini")
 
     parsed = json.loads(content)
+
     marks_awarded = float(parsed.get("marksAwarded", 0))
-    marks_awarded = max(0.0, min(marks_awarded, float(marks)))
+    marks_awarded = max(
+        0.0,
+        min(marks_awarded, float(marks))
+    )
 
     return {
         "isCorrect": bool(parsed.get("isCorrect", False)),
