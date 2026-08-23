@@ -7,7 +7,7 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
+    retry_if_exception,
 )
 
 from app.config import settings
@@ -34,9 +34,7 @@ Difficulty = Literal[
 # ============================================================
 
 if not settings.gemini_api_key:
-    raise RuntimeError(
-        "GEMINI_API_KEY is not configured."
-    )
+    raise RuntimeError("GEMINI_API_KEY is not configured.")
 
 client = genai.Client(
     api_key=settings.gemini_api_key
@@ -160,7 +158,7 @@ def _build_user_prompt(
             f'Use only "{difficulty}" difficulty.'
         )
 
-    # Keep request size reasonable.
+    # Keep prompt within a reasonable size.
     max_chars = 30000
 
     if len(document_text) > max_chars:
@@ -169,9 +167,7 @@ def _build_user_prompt(
     return f"""
 Study material:
 
-"""
-    + document_text
-    + f"""
+{document_text}
 
 Generate up to {num_questions} high-quality quiz questions.
 
@@ -192,18 +188,48 @@ IMPORTANT:
 
 
 # ============================================================
+# RETRY ONLY TRANSIENT ERRORS
+# ============================================================
+
+def _should_retry(exc: Exception) -> bool:
+    """
+    Retry only temporary API errors.
+
+    Do NOT retry:
+    - 400
+    - 401
+    - 403
+    - 404
+    - invalid model errors
+    """
+
+    message = str(exc).lower()
+
+    return any(
+        value in message
+        for value in [
+            "429",
+            "rate limit",
+            "resource exhausted",
+            "temporarily unavailable",
+            "503",
+            "service unavailable",
+            "timeout",
+        ]
+    )
+
+
+# ============================================================
 # GEMINI API CALL
 # ============================================================
 
 @retry(
-    retry=retry_if_exception_type(
-        (Exception,)
-    ),
+    retry=retry_if_exception(_should_retry),
     stop=stop_after_attempt(3),
     wait=wait_exponential(
         multiplier=2,
         min=2,
-        max=10,
+        max=8,
     ),
     reraise=True,
 )
@@ -213,21 +239,17 @@ def _call_gemini(
 ) -> str:
 
     try:
-
         response = client.models.generate_content(
             model=settings.gemini_model,
-            contents=[
-                system_prompt,
-                user_prompt,
-            ],
+            contents=user_prompt,
             config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
                 temperature=0.4,
                 response_mime_type="application/json",
             ),
         )
 
     except Exception as exc:
-
         raise RuntimeError(
             f"Gemini API error: {exc}"
         ) from exc
@@ -253,6 +275,11 @@ def generate_questions(
     question_type: QuestionType,
 ) -> list[dict]:
 
+    if not document_text or not document_text.strip():
+        raise ValueError(
+            "No readable text was extracted from the document."
+        )
+
     user_prompt = _build_user_prompt(
         document_text=document_text,
         num_questions=num_questions,
@@ -261,28 +288,24 @@ def generate_questions(
     )
 
     try:
-
         raw = _call_gemini(
             SYSTEM_PROMPT,
             user_prompt,
         )
 
     except Exception as exc:
-
         raise RuntimeError(
             f"AI generation failed: {exc}"
         ) from exc
 
-    # --------------------------------------------------------
-    # Parse JSON
-    # --------------------------------------------------------
+    # ========================================================
+    # PARSE JSON
+    # ========================================================
 
     try:
-
         parsed = json.loads(raw)
 
     except json.JSONDecodeError as exc:
-
         raise ValueError(
             f"Gemini returned invalid JSON: {exc}"
         ) from exc
@@ -290,15 +313,13 @@ def generate_questions(
     questions = parsed.get("questions")
 
     if not isinstance(questions, list):
-
         raise ValueError(
-            "Gemini response does not contain "
-            "a valid questions list."
+            "Gemini response does not contain a valid questions list."
         )
 
-    # --------------------------------------------------------
-    # Validate questions
-    # --------------------------------------------------------
+    # ========================================================
+    # VALIDATE QUESTIONS
+    # ========================================================
 
     valid_questions = []
 
@@ -308,13 +329,11 @@ def generate_questions(
             isinstance(question, dict)
             and _is_valid_question(question)
         ):
-
             valid_questions.append(
                 _normalize_question(question)
             )
 
     if not valid_questions:
-
         raise ValueError(
             "Gemini returned no valid questions."
         )
@@ -326,9 +345,7 @@ def generate_questions(
 # VALIDATE QUESTION
 # ============================================================
 
-def _is_valid_question(
-    q: dict,
-) -> bool:
+def _is_valid_question(q: dict) -> bool:
 
     required = {
         "questionText",
@@ -338,14 +355,10 @@ def _is_valid_question(
         "marks",
     }
 
-    if not required.issubset(
-        q.keys()
-    ):
+    if not required.issubset(q.keys()):
         return False
 
-    question_type = q.get(
-        "type"
-    )
+    question_type = q.get("type")
 
     # --------------------------------------------------------
     # MCQ
@@ -353,25 +366,13 @@ def _is_valid_question(
 
     if question_type == "mcq":
 
-        options = q.get(
-            "options",
-            []
-        )
-
-        correct = q.get(
-            "correctAnswer"
-        )
+        options = q.get("options", [])
+        correct = q.get("correctAnswer")
 
         return (
-            isinstance(
-                options,
-                list
-            )
+            isinstance(options, list)
             and len(options) == 4
-            and isinstance(
-                correct,
-                str
-            )
+            and isinstance(correct, str)
             and correct in options
         )
 
@@ -381,26 +382,12 @@ def _is_valid_question(
 
     if question_type == "true_false":
 
-        options = q.get(
-            "options",
-            []
-        )
-
-        correct = q.get(
-            "correctAnswer"
-        )
+        options = q.get("options", [])
+        correct = q.get("correctAnswer")
 
         return (
-            options
-            == [
-                "True",
-                "False"
-            ]
-            and correct
-            in [
-                "True",
-                "False"
-            ]
+            options == ["True", "False"]
+            and correct in ["True", "False"]
         )
 
     # --------------------------------------------------------
@@ -409,30 +396,15 @@ def _is_valid_question(
 
     if question_type == "multiple_correct":
 
-        options = q.get(
-            "options",
-            []
-        )
-
-        correct = q.get(
-            "correctAnswer"
-        )
+        options = q.get("options", [])
+        correct = q.get("correctAnswer")
 
         return (
-            isinstance(
-                options,
-                list
-            )
+            isinstance(options, list)
             and 4 <= len(options) <= 6
-            and isinstance(
-                correct,
-                list
-            )
+            and isinstance(correct, list)
             and len(correct) >= 2
-            and all(
-                answer in options
-                for answer in correct
-            )
+            and all(answer in options for answer in correct)
         )
 
     # --------------------------------------------------------
@@ -441,20 +413,12 @@ def _is_valid_question(
 
     if question_type == "short_answer":
 
-        expected_answer = q.get(
-            "expectedAnswer"
-        )
-
-        key_concepts = q.get(
-            "keyConcepts"
-        )
+        expected_answer = q.get("expectedAnswer")
+        key_concepts = q.get("keyConcepts")
 
         return (
             bool(expected_answer)
-            and isinstance(
-                key_concepts,
-                list
-            )
+            and isinstance(key_concepts, list)
             and 2 <= len(key_concepts) <= 5
         )
 
@@ -465,28 +429,20 @@ def _is_valid_question(
 # NORMALIZE QUESTION
 # ============================================================
 
-def _normalize_question(
-    q: dict,
-) -> dict:
+def _normalize_question(q: dict) -> dict:
 
-    # Marks
     try:
         q["marks"] = int(
             q.get("marks") or 1
         )
-    except (
-        ValueError,
-        TypeError
-    ):
+    except (ValueError, TypeError):
         q["marks"] = 1
 
-    # Topic
     q.setdefault(
         "topic",
         "General"
     )
 
-    # Negative marking
     q.setdefault(
         "negativeMarks",
         0
