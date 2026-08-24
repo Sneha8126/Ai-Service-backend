@@ -3,11 +3,12 @@ from typing import Literal
 
 from google import genai
 from google.genai import types
+
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception,
+    retry_if_exception_type,
 )
 
 from app.config import settings
