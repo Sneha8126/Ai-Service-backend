@@ -224,12 +224,12 @@ def _should_retry(exc: Exception) -> bool:
 # ============================================================
 
 @retry(
-    retry=retry_if_exception(_should_retry),
-    stop=stop_after_attempt(3),
+    retry=retry_if_exception_type(Exception),
+    stop=stop_after_attempt(2),
     wait=wait_exponential(
-        multiplier=2,
-        min=2,
-        max=8,
+        multiplier=1,
+        min=1,
+        max=4,
     ),
     reraise=True,
 )
